@@ -33,6 +33,10 @@ TICK_SECONDS = float(os.getenv("REHEARSAL_TICK_SECONDS", "0.1"))
 CODE_DIGITS = int(os.getenv("REHEARSAL_CODE_DIGITS", "8"))
 # A public server keeps every session in memory: cap how many can be open.
 MAX_SESSIONS = int(os.getenv("REHEARSAL_MAX_SESSIONS", "100"))
+# Playback speed of the leader's audio (1.0 = original) and key change in semitones.
+MIN_RATE, MAX_RATE = 0.5, 1.25
+MIN_TRANSPOSE, MAX_TRANSPOSE = -11, 11
+MAX_SETLIST = 60
 # An entry_now is only emitted within this window after its start, so a
 # late tick or reconnection never fires stale cues.
 ENTRY_GRACE_MS = 1500
@@ -101,6 +105,29 @@ class JoinIn(BaseModel):
 class TransportIn(BaseModel):
     action: str
     positionMs: int | None = None
+    value: float | None = None
+
+
+class SetlistItemIn(BaseModel):
+    title: str = ""
+    key: str = ""
+    bpm: float | None = None
+    durationMs: int | None = None
+    # The key each song was left in, so reordering the list keeps it.
+    transpose: int = 0
+
+
+class SetlistIn(BaseModel):
+    setlist: list[SetlistItemIn] = Field(default_factory=list)
+    index: int = 0
+
+
+class SongChangeIn(BaseModel):
+    song: SongIn
+    entries: list[EntryIn] = Field(default_factory=list)
+    transpose: int = 0
+    setlist: list[SetlistItemIn] | None = None
+    index: int | None = None
 
 
 class EntriesIn(BaseModel):
@@ -159,6 +186,10 @@ class Session:
         self.server_ts = now_ms()
         self.seq = 0
         self.current_section: str | None = None
+        self.rate = 1.0
+        self.transpose = 0
+        self.setlist: list[dict[str, Any]] = []
+        self.setlist_index = 0
         self.participants: dict[str, dict[str, Any]] = {}
         self.tokens: dict[str, str] = {}
         self.sockets: dict[str, WebSocket] = {}
@@ -194,7 +225,7 @@ class Session:
 
     # clock --------------------------------------------------------------
     def position_at(self, t: int) -> int:
-        pos = self.position_ms + (t - self.server_ts if self.is_playing else 0)
+        pos = self.position_ms + (int((t - self.server_ts) * self.rate) if self.is_playing else 0)
         duration = self.song.get("durationMs")
         if duration:
             pos = min(pos, duration)
@@ -208,6 +239,8 @@ class Session:
             "state": self.state,
             "seq": self.seq,
             "currentSection": self.current_section,
+            "rate": self.rate,
+            "transpose": self.transpose,
         }
 
     def section_at(self, position: int) -> dict | None:
@@ -234,7 +267,7 @@ class Session:
         self.tracker.reset(self.entries, self.position_at(now_ms()))
 
     # transport ----------------------------------------------------------
-    def apply(self, action: str, position: int | None) -> str | None:
+    def apply(self, action: str, position: int | None, value: float | None = None) -> str | None:
         """Applies a leader transport. Returns the event to broadcast, or
         None when ignored (a periodic sync that arrives after pause/stop
         must not move the stopped clock)."""
@@ -270,12 +303,63 @@ class Session:
             if abs(position - current) > SYNC_JUMP_MS:
                 self.tracker.reset(self.entries, position)
             self.position_ms = position
+        elif action == "rate":
+            if value is None:
+                raise HTTPException(status_code=422, detail="rate requiere value")
+            event = "rate_changed"
+            # Re-anchor first so the position does not jump when the speed changes.
+            self.position_ms = current
+            self.rate = max(MIN_RATE, min(MAX_RATE, round(float(value), 2)))
+        elif action == "transpose":
+            if value is None:
+                raise HTTPException(status_code=422, detail="transpose requiere value")
+            event = "transpose_changed"
+            self.position_ms = current
+            self.transpose = max(MIN_TRANSPOSE, min(MAX_TRANSPOSE, int(round(value))))
+            if 0 <= self.setlist_index < len(self.setlist):
+                self.setlist[self.setlist_index]["transpose"] = self.transpose
         else:
             raise HTTPException(status_code=422, detail=f"Acción desconocida: {action}")
         self.server_ts = now
         self.seq += 1
         self.touched = time.time()
         return event
+
+    # repertoire ---------------------------------------------------------
+    def set_setlist(self, items: list[SetlistItemIn], index: int) -> None:
+        self.setlist = [
+            {
+                "title": item.title.strip()[:80],
+                "key": item.key.strip()[:6],
+                "bpm": item.bpm,
+                "durationMs": item.durationMs,
+                "transpose": max(MIN_TRANSPOSE, min(MAX_TRANSPOSE, item.transpose)),
+            }
+            for item in items[:MAX_SETLIST]
+        ]
+        self.setlist_index = max(0, min(index, max(0, len(self.setlist) - 1)))
+        if self.setlist:
+            self.setlist[self.setlist_index]["transpose"] = self.transpose
+
+    def change_song(self, body: SongChangeIn) -> None:
+        """The leader moves the rehearsal to another song of the repertoire:
+        new material, clock back to 0 and stopped. The speed is kept."""
+        self.song = body.song.model_dump()
+        self.song["sections"] = sorted(self.song["sections"], key=lambda s: s.get("startMs", 0))
+        self.state = "stopped"
+        self.is_playing = False
+        self.position_ms = 0
+        self.current_section = None
+        self.transpose = max(MIN_TRANSPOSE, min(MAX_TRANSPOSE, body.transpose))
+        if body.setlist is not None:
+            self.set_setlist(body.setlist, body.index if body.index is not None else self.setlist_index)
+        elif body.index is not None and self.setlist:
+            self.setlist_index = max(0, min(body.index, len(self.setlist) - 1))
+            self.setlist[self.setlist_index]["transpose"] = self.transpose
+        self.set_entries(body.entries)
+        self.server_ts = now_ms()
+        self.seq += 1
+        self.touched = time.time()
 
     # broadcast ----------------------------------------------------------
     async def broadcast(self, message: dict[str, Any]) -> None:
@@ -299,6 +383,8 @@ class Session:
             **self.clock(),
             "participants": [_public_participant(p) for p in self.participants.values()],
             "entries": self.entries,
+            "setlist": self.setlist,
+            "setlistIndex": self.setlist_index,
         }
 
     async def tick(self) -> None:
@@ -421,7 +507,7 @@ def get_session(session_id: str, x_rehearsal_token: str | None = Header(default=
 async def transport(session_id: str, body: TransportIn, x_rehearsal_token: str | None = Header(default=None)) -> dict[str, Any]:
     session = _resolve(session_id)
     _require(session, x_rehearsal_token, leader=True)
-    event = session.apply(body.action, body.positionMs)
+    event = session.apply(body.action, body.positionMs, body.value)
     if event is None:
         return {"type": "ignored", **session.clock(), "serverTime": now_ms()}
     log(event, session=session.id[:6], positionMs=session.position_ms, playing=session.is_playing)
@@ -437,6 +523,27 @@ async def update_entries(session_id: str, body: EntriesIn, x_rehearsal_token: st
     session.seq += 1
     await session.broadcast({"type": "entry_updated", "entries": session.entries, **session.clock()})
     return {"entries": session.entries, **session.clock()}
+
+
+@app.post("/rehearsal/sessions/{session_id}/setlist")
+async def update_setlist(session_id: str, body: SetlistIn, x_rehearsal_token: str | None = Header(default=None)) -> dict[str, Any]:
+    session = _resolve(session_id)
+    _require(session, x_rehearsal_token, leader=True)
+    session.set_setlist(body.setlist, body.index)
+    session.seq += 1
+    session.touched = time.time()
+    await session.broadcast({"type": "setlist_updated", "setlist": session.setlist, "setlistIndex": session.setlist_index, **session.clock()})
+    return {"setlist": session.setlist, "setlistIndex": session.setlist_index, **session.clock()}
+
+
+@app.post("/rehearsal/sessions/{session_id}/song")
+async def change_song(session_id: str, body: SongChangeIn, x_rehearsal_token: str | None = Header(default=None)) -> dict[str, Any]:
+    session = _resolve(session_id)
+    _require(session, x_rehearsal_token, leader=True)
+    session.change_song(body)
+    log("song_changed", session=session.id[:6], title=session.song.get("title", ""), index=session.setlist_index)
+    await session.broadcast({"type": "song_changed", "snapshot": session.public()})
+    return {"snapshot": session.public(), "serverTime": now_ms()}
 
 
 # --------------------------------------------------------------------------
@@ -482,7 +589,7 @@ async def session_socket(websocket: WebSocket, session_id: str, token: str = "")
                     await websocket.send_json({"type": "error", "detail": "Solo el líder controla el transporte"})
                     continue
                 try:
-                    event = session.apply(message.get("action", ""), message.get("positionMs"))
+                    event = session.apply(message.get("action", ""), message.get("positionMs"), message.get("value"))
                 except HTTPException as error:
                     await websocket.send_json({"type": "error", "detail": error.detail})
                     continue

@@ -28,6 +28,9 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 CODE_TTL_SECONDS = int(os.getenv("REHEARSAL_CODE_TTL_SECONDS", str(2 * 60 * 60)))
 SESSION_TTL_SECONDS = int(os.getenv("REHEARSAL_SESSION_TTL_SECONDS", str(6 * 60 * 60)))
 TICK_SECONDS = float(os.getenv("REHEARSAL_TICK_SECONDS", "0.1"))
+# Digits of the join code: 8 (100 million codes) so it cannot be guessed on a
+# public server; the clients also accept the old 4-digit ones.
+CODE_DIGITS = int(os.getenv("REHEARSAL_CODE_DIGITS", "8"))
 # A public server keeps every session in memory: cap how many can be open.
 MAX_SESSIONS = int(os.getenv("REHEARSAL_MAX_SESSIONS", "100"))
 # An entry_now is only emitted within this window after its start, so a
@@ -330,7 +333,7 @@ _sessions: dict[str, Session] = {}
 def _new_code() -> str:
     active = {s.code for s in _sessions.values()}
     while True:
-        code = f"NEXO-{secrets.randbelow(10000):04d}"
+        code = f"NEXO-{secrets.randbelow(10**CODE_DIGITS):0{CODE_DIGITS}d}"
         if code not in active:
             return code
 
@@ -343,7 +346,7 @@ def _cleanup() -> None:
 
 def _resolve(id_or_code: str) -> Session:
     session = _sessions.get(id_or_code)
-    if session is None and re.fullmatch(r"(?i)nexo-\d{4}", id_or_code):
+    if session is None and re.fullmatch(r"(?i)nexo-\d{4,8}", id_or_code):
         code = id_or_code.upper()
         session = next((s for s in _sessions.values() if s.code == code), None)
         if session is not None and time.time() > session.code_expires:
